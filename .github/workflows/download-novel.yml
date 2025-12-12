@@ -6,6 +6,7 @@ on:
       novel_id:
         description: '小说ID (从番茄小说URL中获取)'
         required: true
+        type: string
       threads:
         description: '下载线程数 (1-10)'
         required: true
