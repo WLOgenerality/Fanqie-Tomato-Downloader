@@ -1,0 +1,105 @@
+name: 七猫小说 TXT 下载器
+
+on:
+  workflow_dispatch:
+    inputs:
+      novel_id:
+        description: '小说 ID（七猫 URL 中的数字）'
+        required: true
+        default: '1673946'
+      threads:
+        description: '并发线程数 1-10'
+        required: true
+        default: '5'
+      format:
+        description: '输出格式'
+        required: true
+        type: choice
+        options:
+          - txt
+          - epub
+        default: 'txt'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 fake-useragent tqdm
+
+      - name: 运行爬虫
+        env:
+          NOVEL_ID: github.event.inputs.noveli​dTHREADS:{{ github.event.inputs.threads }}
+          FORMAT: ${{ github.event.inputs.format }}
+        run: |
+          cat > download.py <<'PY'
+import os, re, time, json, math
+import requests, concurrent.futures
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+from fake_useragent import UserAgent
+
+NOVEL_ID   = os.getenv('NOVEL_ID', '1673946')
+THREADS    = int(os.getenv('THREADS', 5))
+OUT_FORMAT = os.getenv('FORMAT', 'txt')
+
+ua   = UserAgent()
+sess = requests.Session()
+sess.headers.update({'User-Agent': ua.random})
+
+def get_chapter_list():
+    url = f'https://www.qimao.com/reader/index/{NOVEL_ID}/'
+    html = sess.get(url, timeout=15).text
+    soup = BeautifulSoup(html, 'lxml')
+    title = soup.select_one('.book-title').get_text(strip=True)
+    lis = soup.select('.chapter-list li a')
+    return title, [(a['href'], a.get_text(strip=True)) for a in lis]
+
+def fetch_chapter(link):
+    url = f'https://www.qimao.com{link}'
+    html = sess.get(url, timeout=15).text
+    soup = BeautifulSoup(html, 'lxml')
+    content = soup.select_one('.chapter-content')
+    if not content:
+        return ''
+    return '\n'.join(p.get_text(strip=True) for p in content.select('p'))
+
+def main():
+    book_title, chapters = get_chapter_list()
+    print(f'📚 {book_title} 共 {len(chapters)} 章')
+    lines = [f'# {book_title}\n\n']
+    with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as ex:
+        futures = {ex.submit(fetch_chapter, link): idx for idx, (link, _) in enumerate(chapters)}
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(chapters)):
+            idx = futures[future]
+            text = future.result()
+            lines.append(f'## 第{idx+1}章 {chapters[idx][1]}\n{text}\n\n')
+    fname = f'{book_title}.{OUT_FORMAT}'
+    with open(fname, 'w', encoding='utf-8') as f:
+        f.writelines(lines)
+    print(f'✅ 已保存 {fname}')
+
+if __name__ == '__main__':
+    main()
+PY
+          python download.py
+
+      - name: 上传成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: novel-${{ github.event.inputs.novel_id }}-github.event.inputs.formatpath:′∗.{{ github.event.inputs.format }}'
+          retention-days: 7
