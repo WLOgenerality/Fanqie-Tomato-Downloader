@@ -1,0 +1,207 @@
+name: 在线下载小说2
+
+on:
+  workflow_dispatch:  # 允许手动触发工作流
+    inputs:
+      novel_url:
+        description: '小说阅读页URL (七猫: https://www.qimao.com/reader/index/1673946/)'
+        required: true
+        type: string
+      threads:
+        description: '下载线程数 (1-5，建议≤3避免反爬)'
+        required: true
+        default: '2'
+      format:
+        description: '输出格式'
+        required: true
+        type: choice
+        options:
+          - txt
+          - epub
+        default: 'txt'
+
+# 添加必要的权限
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  download-novel:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v3
+        
+      - name: 设置Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 lxml ebooklib  # 依赖库
+          
+      - name: 编写小说爬取脚本
+        run: |
+          cat > novel_spider.py << 'EOF'
+          import re
+          import sys
+          import time
+          import random
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import requests
+          from bs4 import BeautifulSoup
+          from ebooklib import epub
+
+          # 配置项
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          }
+          DELAY = (1, 3)  # 请求延时范围(秒)
+
+          def extract_novel_id(novel_url):
+              """从URL中提取小说ID"""
+              match = re.search(r"/reader/index/(\d+)/", novel_url)
+              if not match:
+                  raise ValueError("无效的七猫小说URL")
+              return match.group(1)
+
+          def get_chapter_list(novel_id):
+              """获取小说章节列表与标题"""
+              chapter_url = f"https://www.qimao.com/reader/index/{novel_id}/"
+              response = requests.get(chapter_url, headers=HEADERS, timeout=10)
+              response.raise_for_status()
+              soup = BeautifulSoup(response.text, "lxml")
+              
+              # 提取小说标题
+              novel_title = soup.find("h1", class_="book-title")
+              novel_title = novel_title.text.strip() if novel_title else "未知小说"
+              
+              # 提取章节列表 (七猫章节列表在章节选择器中)
+              chapter_list = []
+              chapter_items = soup.select("ul.chapter-list li a")
+              for item in chapter_items:
+                  chapter_title = item.text.strip()
+                  chapter_href = item.get("href")
+                  if not chapter_href.startswith("http"):
+                      chapter_href = f"https://www.qimao.com{chapter_href}"
+                  chapter_list.append({"title": chapter_title, "url": chapter_href})
+              return novel_title, chapter_list[:482]  # 限制482章
+
+          def get_chapter_content(chapter_info):
+              """获取单章内容"""
+              title = chapter_info["title"]
+              url = chapter_info["url"]
+              try:
+                  time.sleep(random.uniform(*DELAY))  # 随机延时
+                  response = requests.get(url, headers=HEADERS, timeout=10)
+                  response.raise_for_status()
+                  soup = BeautifulSoup(response.text, "lxml")
+                  # 提取正文内容 (七猫正文在content类标签)
+                  content_div = soup.find("div", class_="content")
+                  if not content_div:
+                      return title, "【章节内容获取失败】"
+                  # 清理广告与无关标签
+                  for ad in content_div.select("script, style, .ad-wrap"):
+                      ad.decompose()
+                  content = content_div.text.strip().replace("\u3000\u3000", "\n  ")
+                  return title, content
+              except Exception as e:
+                  return title, f"【章节获取异常: {str(e)}】"
+
+          def save_to_txt(novel_title, chapters, save_path):
+              """保存为TXT文件"""
+              txt_path = f"{save_path}/{novel_title}.txt"
+              with open(txt_path, "w", encoding="utf-8") as f:
+                  f.write(f"{novel_title}\n\n")
+                  for title, content in chapters:
+                      f.write(f"==== {title} ====\n")
+                      f.write(content + "\n\n")
+              return txt_path
+
+          def save_to_epub(novel_title, chapters, save_path):
+              """保存为EPUB文件"""
+              epub_path = f"{save_path}/{novel_title}.epub"
+              book = epub.EpubBook()
+              book.set_title(novel_title)
+              book.set_language("zh")
+              
+              # 添加章节
+              epub_chapters = []
+              for title, content in chapters:
+                  c = epub.EpubHtml(title=title, file_name=f"chap_{title.replace('/', '_')}.xhtml", lang="zh")
+                  c.content = f"<h1>{title}</h1><p>{content.replace('\n', '</p><p>')}</p>"
+                  book.add_item(c)
+                  epub_chapters.append(c)
+              
+              book.toc = tuple(epub_chapters)
+              book.add_item(epub.EpubNcx())
+              book.add_item(epub.EpubNav())
+              book.spine = ["nav"] + epub_chapters
+              epub.write_epub(epub_path, book, {})
+              return epub_path
+
+          def main():
+              if len(sys.argv) != 4:
+                  print("用法: python novel_spider.py <novel_url> <output_format> <threads>")
+                  sys.exit(1)
+              
+              novel_url = sys.argv[1]
+              output_format = sys.argv[2].lower()
+              threads = int(sys.argv[3])
+              save_path = "novel_output"
+              os.makedirs(save_path, exist_ok=True)
+              
+              try:
+                  novel_id = extract_novel_id(novel_url)
+                  print(f"提取小说ID: {novel_id}")
+                  novel_title, chapter_list = get_chapter_list(novel_id)
+                  print(f"获取到 {len(chapter_list)} 章，开始下载...")
+                  
+                  # 多线程下载章节
+                  chapters_content = []
+                  with ThreadPoolExecutor(max_workers=threads) as executor:
+                      futures = [executor.submit(get_chapter_content, chap) for chap in chapter_list]
+                      for future in as_completed(futures):
+                          chapters_content.append(future.result())
+                  # 按原章节顺序排序
+                  chapters_content = sorted(chapters_content, key=lambda x: chapter_list.index(next(c for c in chapter_list if c['title'] == x[0])))
+                  
+                  # 保存文件
+                  if output_format == "txt":
+                      output_file = save_to_txt(novel_title, chapters_content, save_path)
+                  elif output_format == "epub":
+                      output_file = save_to_epub(novel_title, chapters_content, save_path)
+                  else:
+                      raise ValueError("不支持的格式")
+                  print(f"文件保存成功: {output_file}")
+              except Exception as e:
+                  print(f"错误: {str(e)}")
+                  sys.exit(1)
+
+          if __name__ == "__main__":
+              import os
+              main()
+          EOF
+          
+      - name: 运行爬取脚本
+        run: |
+          mkdir -p novel_output
+          python novel_spider.py "${{ github.event.inputs.novel_url }}" "${{ github.event.inputs.format }}" "${{ github.event.inputs.threads }}"
+          
+      - name: 压缩结果文件
+        run: |
+          cd novel_output && zip -r ../novel_result.zip *
+          
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: novel-result-${{ github.event.inputs.format }}
+          path: novel_result.zip
+          retention-days: 7
+          
+      - name: 完成提示
+        run: |
+          echo "🎉 小说下载完成！产物已上传至Action Artifacts，有效期7天。"
